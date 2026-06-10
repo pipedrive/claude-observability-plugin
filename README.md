@@ -59,3 +59,16 @@
 
   MIT
 ```
+
+## Privacy
+
+This plugin transmits your Claude Code session data — conversation turns, assistant
+generations, tool calls, and token-usage statistics — to the Langfuse endpoint you
+configure (`LANGFUSE_BASE_URL`, default `https://us.cloud.langfuse.com`; EU and
+self-hosted endpoints are supported). Data is sent at the end of each session (the
+`Stop` hook) using the Langfuse API keys you provide, which are stored in your OS
+keychain. No data is sent anywhere other than the endpoint you configure.
+
+For how Langfuse Cloud handles data it receives, see the Langfuse privacy policy:
+https://langfuse.com/privacy . When using a self-hosted Langfuse instance, your data
+stays within your own infrastructure.
