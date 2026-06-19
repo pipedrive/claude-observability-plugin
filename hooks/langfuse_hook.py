@@ -307,11 +307,45 @@ def get_usage(msg: Dict[str, Any]) -> Optional[Dict[str, int]]:
         ("input_tokens", "input"),
         ("output_tokens", "output"),
         ("cache_read_input_tokens", "cache_read_input_tokens"),
-        ("cache_creation_input_tokens", "cache_creation_input_tokens"),
     ):
         v = u.get(src)
         if isinstance(v, int) and v > 0:
             details[dst] = v
+
+    # Cache-creation writes are billed at two TTL rates (5m vs 1h). The flat
+    # `cache_creation_input_tokens` field merges both, so emitting it would price
+    # everything at the 5m rate. When the per-TTL breakdown is present, emit the
+    # split keys INSTEAD of the flat one (both carry distinct prices in Langfuse,
+    # so emitting both would double-count). Fall back to the flat field otherwise.
+    cc = u.get("cache_creation")
+    emitted_split = False
+    if isinstance(cc, dict):
+        for src, dst in (
+            ("ephemeral_5m_input_tokens", "input_cache_creation_5m"),
+            ("ephemeral_1h_input_tokens", "input_cache_creation_1h"),
+        ):
+            v = cc.get(src)
+            if isinstance(v, int) and v > 0:
+                details[dst] = v
+                emitted_split = True
+    if not emitted_split:
+        v = u.get("cache_creation_input_tokens")
+        if isinstance(v, int) and v > 0:
+            details["cache_creation_input_tokens"] = v
+
+    # Server-side tools (web search / fetch) are billed per request, separately
+    # from tokens. Forward the counts so they're visible and can be priced once
+    # the model definitions carry matching price keys.
+    stu = u.get("server_tool_use")
+    if isinstance(stu, dict):
+        for src, dst in (
+            ("web_search_requests", "web_search_requests"),
+            ("web_fetch_requests", "web_fetch_requests"),
+        ):
+            v = stu.get(src)
+            if isinstance(v, int) and v > 0:
+                details[dst] = v
+
     return details or None
 
 def get_message_id(msg: Dict[str, Any]) -> Optional[str]:
