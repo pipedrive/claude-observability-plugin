@@ -339,13 +339,20 @@ class SessionState:
     offset: int = 0
     buffer: str = ""
     turn_count: int = 0
+    # Raw rows of the turn that is still open (its assistant work may continue in
+    # a later hook firing). Carried across invocations so a turn split by multiple
+    # Stop firings is emitted once, complete, instead of having its continuation
+    # rows dropped (they'd arrive at the start of a chunk with no leading user row).
+    pending: Optional[List[Dict[str, Any]]] = None
 
 def load_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
+    pending = s.get("pending")
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
         turn_count=int(s.get("turn_count", 0)),
+        pending=pending if isinstance(pending, list) else [],
     )
 
 def write_session_state(global_state: Dict[str, Any], key: str, ss: SessionState) -> None:
@@ -353,6 +360,7 @@ def write_session_state(global_state: Dict[str, Any], key: str, ss: SessionState
         "offset": ss.offset,
         "buffer": ss.buffer,
         "turn_count": ss.turn_count,
+        "pending": ss.pending or [],
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -493,7 +501,38 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             mid = get_message_id(msg) or f"noid:{len(assistant_order)}"
             if mid not in assistant_latest:
                 assistant_order.append(mid)
-            assistant_latest[mid] = msg
+                assistant_latest[mid] = msg
+            else:
+                # Claude Code writes one content block per JSONL row, all sharing
+                # the same message.id (row0=thinking, row1=text, row2=tool_use, ...).
+                # Overwriting would keep only the LAST block and silently drop the
+                # rest — e.g. Task/Agent spawns that precede a later tool_use. Merge
+                # the content arrays instead, deduping tool_use blocks by id so a
+                # row re-read across reads can't double-count.
+                prev = assistant_latest[mid]
+                prev_content = get_content(prev)
+                new_content = get_content(msg)
+                if isinstance(prev_content, list) and isinstance(new_content, list):
+                    seen_tool_ids = {
+                        b.get("id") for b in prev_content
+                        if isinstance(b, dict) and b.get("type") == "tool_use"
+                    }
+                    additions = [
+                        b for b in new_content
+                        if not (isinstance(b, dict) and b.get("type") == "tool_use"
+                                and b.get("id") in seen_tool_ids)
+                    ]
+                    merged = prev_content + additions
+                    if "message" in prev and isinstance(prev["message"], dict):
+                        prev["message"]["content"] = merged
+                    else:
+                        prev["content"] = merged
+                    # Terminal fields (stop_reason/usage/model) land on the last row.
+                    for fld in ("stop_reason", "usage", "model"):
+                        m = msg.get("message", {})
+                        if isinstance(m, dict) and m.get(fld) is not None:
+                            prev.setdefault("message", {})[fld] = m[fld]
+                assistant_latest[mid] = prev
             continue
 
         # ignore unknown rows
@@ -501,6 +540,35 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
     # flush last
     flush_turn()
     return turns
+
+
+def _is_turn_start(msg: Dict[str, Any]) -> bool:
+    """True for a row that begins a new turn: a real user prompt (role=user,
+    not an injected isMeta row, not a tool_result row)."""
+    if not isinstance(msg, dict) or msg.get("isMeta"):
+        return False
+    if get_role(msg) != "user":
+        return False
+    return not is_tool_result(msg)
+
+
+def split_closed_open(rows: List[Dict[str, Any]], flush_all: bool
+                      ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Partition raw transcript rows into (closed_rows, open_rows).
+
+    The last turn in the stream is considered still *open* — its assistant work
+    may continue in a future hook firing — so its rows are held back unless
+    flush_all is set (e.g. on SessionEnd). Everything before the last turn's
+    start is closed and safe to emit. Carrying open rows forward (rather than
+    advancing past them) is what prevents continuation rows from being dropped.
+    """
+    start_idxs = [i for i, m in enumerate(rows) if _is_turn_start(m)]
+    if flush_all or len(start_idxs) <= 1:
+        # SessionEnd flushes everything; with 0/1 turn starts there is nothing
+        # closed to split off yet, so the whole thing stays open.
+        return (rows, []) if flush_all else ([], rows)
+    boundary = start_idxs[-1]
+    return rows[:boundary], rows[boundary:]
 
 # ----------------- Langfuse emit -----------------
 def _to_ns(ts: Optional[datetime]) -> Optional[int]:
@@ -610,7 +678,10 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
             name=f"Claude Code - Turn {turn_num}",
             as_type="span",
             start_time=user_ts,
-            input={"role": "user", "content": user_text},
+            # ChatML array (not a bare object) so Langfuse renders it as a chat
+            # message instead of falling back to a raw-JSON dump. See
+            # mapToChatMl(): only arrays / [[...]] / {messages:[...]} are detected.
+            input=[{"role": "user", "content": user_text}],
             metadata=trace_metadata,
         )
         parent_otel_span = trace_span._otel_span
@@ -628,36 +699,54 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
             model = get_model(am)
             tool_uses = iter_tool_uses(get_content(am))
 
-            # Build generation input: user message for first generation, otherwise tool results from
-            # the prior batch (best partial reconstruction of the prompt context).
+            # Build generation input as a ChatML message array: the user message
+            # for the first generation, otherwise the prior batch's tool results
+            # as role="tool" messages (best partial reconstruction of the prompt
+            # context). Arrays + role/tool_call_id are what Langfuse's ChatML
+            # parser recognizes for pretty rendering.
             if idx == 0:
-                gen_input: Any = {"role": "user", "content": user_text}
+                gen_input: Any = [{"role": "user", "content": user_text}]
             elif prev_tool_results:
-                gen_input = {"role": "tool", "tool_results": prev_tool_results}
+                gen_input = [
+                    {
+                        "role": "tool",
+                        "content": tr.get("output") or "",
+                        "tool_call_id": tr.get("tool_use_id"),
+                    }
+                    for tr in prev_tool_results
+                ]
             else:
                 gen_input = None
 
             # Build generation output: include both the text response and any tool calls the LLM
             # decided to make. Most assistant messages in tool-using turns are tool-call-only, so
             # without tool_calls in the output, the observation looks empty.
+            # Langfuse's ToolCallSchema requires {id, name, arguments} where
+            # arguments is a JSON *string* (an `input` object is not recognized
+            # and breaks ChatML detection for the whole message).
             gen_tool_calls = []
             for tu in tool_uses:
                 tu_input = tu.get("input")
                 if isinstance(tu_input, str):
-                    tu_input_serialized, _ = truncate_text(tu_input)
+                    arguments, _ = truncate_text(tu_input)
                 else:
-                    tu_input_serialized = tu_input
+                    arguments, _ = truncate_text(
+                        json.dumps(tu_input if tu_input is not None else {}, ensure_ascii=False)
+                    )
                 gen_tool_calls.append({
                     "id": tu.get("id"),
                     "name": tu.get("name"),
-                    "input": tu_input_serialized,
+                    "arguments": arguments,
+                    "type": "function",
                 })
 
-            gen_output: Dict[str, Any] = {"role": "assistant"}
+            gen_output_msg: Dict[str, Any] = {"role": "assistant"}
             if am_text:
-                gen_output["content"] = am_text
+                gen_output_msg["content"] = am_text
             if gen_tool_calls:
-                gen_output["tool_calls"] = gen_tool_calls
+                gen_output_msg["tool_calls"] = gen_tool_calls
+            # ChatML array so the output renders as a chat message.
+            gen_output = [gen_output_msg]
 
             gen_kwargs: Dict[str, Any] = dict(
                 model=model,
@@ -752,7 +841,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
             elif am_ts is not None:
                 prev_ts = am_ts
 
-        trace_span.update(output={"role": "assistant", "content": final_assistant_text})
+        trace_span.update(output=[{"role": "assistant", "content": final_assistant_text}])
         trace_span.end(end_time=_to_ns(turn_end_ts or last_assistant_ts or user_ts))
 
 # ----------------- Main -----------------
@@ -793,12 +882,22 @@ def main() -> int:
             ss = load_session_state(state, key)
 
             msgs, ss = read_new_jsonl(transcript_path, ss)
-            if not msgs:
-                write_session_state(state, key, ss)
-                save_state(state)
-                return 0
 
-            turns = build_turns(msgs)
+            # SessionEnd flushes the still-open turn; Stop holds it back so its
+            # continuation (Stop can fire many times within one turn — blocking
+            # hooks, background-agent notifications) is not dropped.
+            is_session_end = str(
+                payload.get("hook_event_name") or payload.get("hookEventName") or ""
+            ).lower() == "sessionend"
+
+            # Re-attach the carried-over open turn to the newly read rows, then
+            # split off the turns that are now closed (safe to emit) from the one
+            # still open (held back / persisted unless SessionEnd).
+            combined = (ss.pending or []) + msgs
+            closed_rows, open_rows = split_closed_open(combined, flush_all=is_session_end)
+            ss.pending = open_rows
+
+            turns = build_turns(closed_rows) if closed_rows else []
             if not turns:
                 write_session_state(state, key, ss)
                 save_state(state)
