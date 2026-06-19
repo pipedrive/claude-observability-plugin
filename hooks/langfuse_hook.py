@@ -339,13 +339,20 @@ class SessionState:
     offset: int = 0
     buffer: str = ""
     turn_count: int = 0
+    # Raw rows of the turn that is still open (its assistant work may continue in
+    # a later hook firing). Carried across invocations so a turn split by multiple
+    # Stop firings is emitted once, complete, instead of having its continuation
+    # rows dropped (they'd arrive at the start of a chunk with no leading user row).
+    pending: Optional[List[Dict[str, Any]]] = None
 
 def load_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
+    pending = s.get("pending")
     return SessionState(
         offset=int(s.get("offset", 0)),
         buffer=str(s.get("buffer", "")),
         turn_count=int(s.get("turn_count", 0)),
+        pending=pending if isinstance(pending, list) else [],
     )
 
 def write_session_state(global_state: Dict[str, Any], key: str, ss: SessionState) -> None:
@@ -353,6 +360,7 @@ def write_session_state(global_state: Dict[str, Any], key: str, ss: SessionState
         "offset": ss.offset,
         "buffer": ss.buffer,
         "turn_count": ss.turn_count,
+        "pending": ss.pending or [],
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -467,10 +475,18 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
         # tool_result rows show up as role=user with content blocks of type tool_result
         if is_tool_result(msg):
             row_ts = msg.get("timestamp")
+            # Agent/Task tool results carry the spawned subagent's id, used to
+            # link its separate transcript file when meta.json lookup misses.
+            tur = msg.get("toolUseResult")
+            agent_id = tur.get("agentId") if isinstance(tur, dict) else None
             for tr in iter_tool_results(get_content(msg)):
                 tid = tr.get("tool_use_id")
                 if tid:
-                    tool_results_by_id[str(tid)] = {"content": tr.get("content"), "timestamp": row_ts}
+                    tool_results_by_id[str(tid)] = {
+                        "content": tr.get("content"),
+                        "timestamp": row_ts,
+                        "agent_id": agent_id,
+                    }
             continue
 
         if role == "user":
@@ -493,7 +509,38 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             mid = get_message_id(msg) or f"noid:{len(assistant_order)}"
             if mid not in assistant_latest:
                 assistant_order.append(mid)
-            assistant_latest[mid] = msg
+                assistant_latest[mid] = msg
+            else:
+                # Claude Code writes one content block per JSONL row, all sharing
+                # the same message.id (row0=thinking, row1=text, row2=tool_use, ...).
+                # Overwriting would keep only the LAST block and silently drop the
+                # rest — e.g. Task/Agent spawns that precede a later tool_use. Merge
+                # the content arrays instead, deduping tool_use blocks by id so a
+                # row re-read across reads can't double-count.
+                prev = assistant_latest[mid]
+                prev_content = get_content(prev)
+                new_content = get_content(msg)
+                if isinstance(prev_content, list) and isinstance(new_content, list):
+                    seen_tool_ids = {
+                        b.get("id") for b in prev_content
+                        if isinstance(b, dict) and b.get("type") == "tool_use"
+                    }
+                    additions = [
+                        b for b in new_content
+                        if not (isinstance(b, dict) and b.get("type") == "tool_use"
+                                and b.get("id") in seen_tool_ids)
+                    ]
+                    merged = prev_content + additions
+                    if "message" in prev and isinstance(prev["message"], dict):
+                        prev["message"]["content"] = merged
+                    else:
+                        prev["content"] = merged
+                    # Terminal fields (stop_reason/usage/model) land on the last row.
+                    for fld in ("stop_reason", "usage", "model"):
+                        m = msg.get("message", {})
+                        if isinstance(m, dict) and m.get(fld) is not None:
+                            prev.setdefault("message", {})[fld] = m[fld]
+                assistant_latest[mid] = prev
             continue
 
         # ignore unknown rows
@@ -501,6 +548,35 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
     # flush last
     flush_turn()
     return turns
+
+
+def _is_turn_start(msg: Dict[str, Any]) -> bool:
+    """True for a row that begins a new turn: a real user prompt (role=user,
+    not an injected isMeta row, not a tool_result row)."""
+    if not isinstance(msg, dict) or msg.get("isMeta"):
+        return False
+    if get_role(msg) != "user":
+        return False
+    return not is_tool_result(msg)
+
+
+def split_closed_open(rows: List[Dict[str, Any]], flush_all: bool
+                      ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Partition raw transcript rows into (closed_rows, open_rows).
+
+    The last turn in the stream is considered still *open* — its assistant work
+    may continue in a future hook firing — so its rows are held back unless
+    flush_all is set (e.g. on SessionEnd). Everything before the last turn's
+    start is closed and safe to emit. Carrying open rows forward (rather than
+    advancing past them) is what prevents continuation rows from being dropped.
+    """
+    start_idxs = [i for i, m in enumerate(rows) if _is_turn_start(m)]
+    if flush_all or len(start_idxs) <= 1:
+        # SessionEnd flushes everything; with 0/1 turn starts there is nothing
+        # closed to split off yet, so the whole thing stays open.
+        return (rows, []) if flush_all else ([], rows)
+    boundary = start_idxs[-1]
+    return rows[:boundary], rows[boundary:]
 
 # ----------------- Langfuse emit -----------------
 def _to_ns(ts: Optional[datetime]) -> Optional[int]:
@@ -562,8 +638,291 @@ def collect_skill_tags(turn: Turn) -> List[str]:
     return names
 
 
+def discover_subagents(transcript_path: Path, session_id: Optional[str]
+                       ) -> Tuple[Dict[str, Path], Dict[str, Path]]:
+    """Map a session's subagent transcripts to their parent Agent/Task tool calls.
+
+    Claude Code writes each spawned agent's transcript to
+        <project>/<session-id>/subagents/agent-<agentId>.jsonl
+    with a sibling agent-<agentId>.meta.json carrying the parent tool_use id
+    (``toolUseId``). Returns ``(by_tool_use_id, by_agent_id)`` so emit can nest a
+    subagent's internal steps under the right Agent/Task tool span. The agent-id
+    map is a fallback keyed off the main transcript's ``toolUseResult.agentId``.
+    """
+    by_tool_use_id: Dict[str, Path] = {}
+    by_agent_id: Dict[str, Path] = {}
+    dirs: List[Path] = []
+    try:
+        dirs.append(transcript_path.with_suffix("") / "subagents")
+    except Exception:
+        pass
+    if session_id:
+        dirs.append(transcript_path.parent / session_id / "subagents")
+
+    seen: set = set()
+    for d in dirs:
+        try:
+            dkey = str(d.resolve())
+        except Exception:
+            dkey = str(d)
+        if dkey in seen:
+            continue
+        seen.add(dkey)
+        try:
+            if not d.is_dir():
+                continue
+            meta_files = sorted(d.glob("agent-*.meta.json"))
+        except Exception:
+            continue
+        for meta_file in meta_files:
+            jsonl = meta_file.with_name(meta_file.name[: -len(".meta.json")] + ".jsonl")
+            if not jsonl.exists():
+                continue
+            agent_id = jsonl.stem[len("agent-"):] if jsonl.stem.startswith("agent-") else None
+            if agent_id:
+                by_agent_id.setdefault(agent_id, jsonl)
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+            tuid = meta.get("toolUseId") if isinstance(meta, dict) else None
+            if isinstance(tuid, str) and tuid:
+                by_tool_use_id.setdefault(tuid, jsonl)
+    if by_tool_use_id or by_agent_id:
+        debug(f"discover_subagents: {len(by_tool_use_id)} by tool_use_id, "
+              f"{len(by_agent_id)} by agent_id")
+    return by_tool_use_id, by_agent_id
+
+
+def emit_subagent(langfuse: Langfuse, sub_path: Path, parent_otel_span: Any,
+                  subagent_index: Tuple[Dict[str, Path], Dict[str, Path]], depth: int) -> None:
+    """Read a subagent transcript and emit its turns' generations/tool spans
+    nested under parent_otel_span (the Agent/Task tool span in the parent trace),
+    so the subagent's actual work is visible instead of just its final report."""
+    if depth > 5:
+        return
+    try:
+        rows: List[Dict[str, Any]] = []
+        with open(sub_path, "r", encoding="utf-8") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rows.append(json.loads(ln))
+                except Exception:
+                    continue
+    except Exception as e:
+        debug(f"emit_subagent read failed for {sub_path}: {e}")
+        return
+
+    sub_turns = build_turns(rows)
+    debug(f"subagent {sub_path.name}: {len(rows)} rows -> {len(sub_turns)} turn(s) at depth {depth}")
+    for st in sub_turns:
+        st_user_text, _ = truncate_text(extract_text(get_content(st.user_msg)))
+        _emit_assistant_steps(
+            langfuse,
+            assistant_msgs=st.assistant_msgs,
+            tool_results_by_id=st.tool_results_by_id,
+            injected_by_tool_id=st.injected_by_tool_id,
+            parent_otel_span=parent_otel_span,
+            start_ts=parse_ts(st.user_msg),
+            first_user_text=st_user_text,
+            gen_name_prefix="Subagent Generation",
+            subagent_index=subagent_index,
+            depth=depth,
+        )
+
+
+def _emit_assistant_steps(
+    langfuse: Langfuse,
+    *,
+    assistant_msgs: List[Dict[str, Any]],
+    tool_results_by_id: Dict[str, Any],
+    injected_by_tool_id: Dict[str, str],
+    parent_otel_span: Any,
+    start_ts: Optional[datetime],
+    first_user_text: str,
+    gen_name_prefix: str = "Claude Generation",
+    subagent_index: Optional[Tuple[Dict[str, Path], Dict[str, Path]]] = None,
+    depth: int = 0,
+) -> Optional[datetime]:
+    """Emit a generation + nested tool spans for each assistant message under
+    parent_otel_span. Shared by top-level turns and (recursively, via
+    emit_subagent) by subagent transcripts so an Agent/Task's internal steps
+    render nested in the trace. Returns the last advanced timestamp."""
+    # prev_ts = the moment the next generation could have started (= when the
+    # previous batch of tool results all returned, or the starting timestamp).
+    prev_ts = start_ts
+    prev_tool_results: List[Dict[str, Any]] = []  # surfaced as next gen's input
+
+    for idx, am in enumerate(assistant_msgs):
+        am_ts = parse_ts(am)
+        am_text_raw = extract_text(get_content(am))
+        am_text, am_text_meta = truncate_text(am_text_raw)
+        model = get_model(am)
+        tool_uses = iter_tool_uses(get_content(am))
+
+        # Build generation input as a ChatML message array: the user/prompt text
+        # for the first generation, otherwise the prior batch's tool results as
+        # role="tool" messages (best partial reconstruction of the prompt
+        # context). Arrays + role/tool_call_id are what Langfuse's ChatML parser
+        # recognizes for pretty rendering.
+        if idx == 0:
+            gen_input: Any = [{"role": "user", "content": first_user_text}]
+        elif prev_tool_results:
+            gen_input = [
+                {
+                    "role": "tool",
+                    "content": tr.get("output") or "",
+                    "tool_call_id": tr.get("tool_use_id"),
+                }
+                for tr in prev_tool_results
+            ]
+        else:
+            gen_input = None
+
+        # Build generation output: text response + any tool calls the LLM made.
+        # Most assistant messages in tool-using turns are tool-call-only, so
+        # without tool_calls the observation looks empty. Langfuse's
+        # ToolCallSchema requires {id, name, arguments} where arguments is a JSON
+        # *string* (an `input` object is not recognized and breaks ChatML
+        # detection for the whole message).
+        gen_tool_calls = []
+        for tu in tool_uses:
+            tu_input = tu.get("input")
+            if isinstance(tu_input, str):
+                arguments, _ = truncate_text(tu_input)
+            else:
+                arguments, _ = truncate_text(
+                    json.dumps(tu_input if tu_input is not None else {}, ensure_ascii=False)
+                )
+            gen_tool_calls.append({
+                "id": tu.get("id"),
+                "name": tu.get("name"),
+                "arguments": arguments,
+                "type": "function",
+            })
+
+        gen_output_msg: Dict[str, Any] = {"role": "assistant"}
+        if am_text:
+            gen_output_msg["content"] = am_text
+        if gen_tool_calls:
+            gen_output_msg["tool_calls"] = gen_tool_calls
+        gen_output = [gen_output_msg]  # ChatML array so it renders as a chat message
+
+        gen_kwargs: Dict[str, Any] = dict(
+            model=model,
+            input=gen_input,
+            output=gen_output,
+            metadata={
+                "assistant_index": idx,
+                "assistant_text": am_text_meta,
+                "tool_count": len(tool_uses),
+                "subagent_depth": depth,
+            },
+        )
+        usage_details = get_usage(am)
+        if usage_details is not None:
+            gen_kwargs["usage_details"] = usage_details
+
+        gen_span = _start_backdated(
+            langfuse,
+            name=f"{gen_name_prefix} {idx + 1}",
+            as_type="generation",
+            start_time=prev_ts or am_ts,
+            parent_otel_span=parent_otel_span,
+            **gen_kwargs,
+        )
+
+        # Tool observations: nested under this generation. Each starts when the
+        # assistant emitted the tool_use (am_ts) and ends when its result arrived.
+        batch_result_ts: List[datetime] = []
+        batch_tool_results: List[Dict[str, Any]] = []
+        for tu in tool_uses:
+            tid = str(tu.get("id") or "")
+            tname = tu.get("name") or "unknown"
+            tinput_raw = tu.get("input") if isinstance(tu.get("input"), (dict, list, str, int, float, bool)) else {}
+            if isinstance(tinput_raw, str):
+                tinput, tinput_meta = truncate_text(tinput_raw)
+            else:
+                tinput, tinput_meta = tinput_raw, None
+
+            tr_entry = tool_results_by_id.get(tid) if tid else None
+            if tr_entry:
+                out_raw = tr_entry.get("content")
+                out_str = out_raw if isinstance(out_raw, str) else json.dumps(out_raw, ensure_ascii=False)
+                out_trunc, out_meta = truncate_text(out_str)
+                tr_ts = parse_ts(tr_entry.get("timestamp"))
+            else:
+                out_trunc, out_meta, tr_ts = None, None, None
+            if tr_ts is not None:
+                batch_result_ts.append(tr_ts)
+
+            # Skill invocations inject their instructions as a separate transcript
+            # row; optionally surface them on the tool span they belong to.
+            tool_output: Any = out_trunc
+            if CAPTURE_SKILL_CONTENT:
+                injected = injected_by_tool_id.get(tid) if tid else None
+                if injected:
+                    injected_trunc, _ = truncate_text(injected)
+                    tool_output = {"result": out_trunc, "injected_instructions": injected_trunc}
+
+            tool_span = _start_backdated(
+                langfuse,
+                name=f"Tool: {tname}",
+                as_type="tool",
+                start_time=am_ts,
+                parent_otel_span=gen_span._otel_span,
+                input=tinput,
+                metadata={
+                    "tool_name": tname,
+                    "tool_id": tid,
+                    "input_meta": tinput_meta,
+                    "output_meta": out_meta,
+                },
+            )
+            tool_span.update(output=tool_output)
+
+            # An Agent/Task tool runs a whole subagent whose steps live in a
+            # separate transcript. Nest those steps under this tool span so the
+            # subagent's generations and tool calls are visible in the trace.
+            if subagent_index is not None and tname in ("Agent", "Task") and depth < 5:
+                sub_path = subagent_index[0].get(tid)
+                if sub_path is None and tr_entry:
+                    aid = tr_entry.get("agent_id")
+                    if isinstance(aid, str) and aid:
+                        sub_path = subagent_index[1].get(aid)
+                if sub_path is not None:
+                    emit_subagent(langfuse, sub_path, tool_span._otel_span, subagent_index, depth + 1)
+
+            tool_span.end(end_time=_to_ns(tr_ts or am_ts))
+
+            batch_tool_results.append({
+                "tool_use_id": tid,
+                "tool_name": tname,
+                "output": out_trunc,
+            })
+
+        # End the generation AFTER its tools so the timeline cleanly contains them.
+        gen_end_ts = max(batch_result_ts) if batch_result_ts else am_ts
+        gen_span.end(end_time=_to_ns(gen_end_ts or am_ts or prev_ts))
+
+        # Carry this batch's results into the next generation's input.
+        prev_tool_results = batch_tool_results
+
+        # Advance prev_ts: next gen can only start after this batch's results returned.
+        if batch_result_ts:
+            prev_ts = max(batch_result_ts)
+        elif am_ts is not None:
+            prev_ts = am_ts
+
+    return prev_ts
+
+
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
-              user_id: Optional[str] = None) -> None:
+              user_id: Optional[str] = None,
+              subagent_index: Optional[Tuple[Dict[str, Path], Dict[str, Path]]] = None) -> None:
     user_text_raw = extract_text(get_content(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
 
@@ -610,149 +969,30 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
             name=f"Claude Code - Turn {turn_num}",
             as_type="span",
             start_time=user_ts,
-            input={"role": "user", "content": user_text},
+            # ChatML array (not a bare object) so Langfuse renders it as a chat
+            # message instead of falling back to a raw-JSON dump. See
+            # mapToChatMl(): only arrays / [[...]] / {messages:[...]} are detected.
+            input=[{"role": "user", "content": user_text}],
             metadata=trace_metadata,
         )
         parent_otel_span = trace_span._otel_span
 
-        # Iterate each assistant message: emit generation, then its tool_use children.
-        # prev_ts = the moment the next generation could have started (= when the previous
-        # batch of tool results all returned, or the original user message timestamp).
-        prev_ts = user_ts
-        prev_tool_results: List[Dict[str, Any]] = []  # populated after each batch, surfaced as next gen's input
+        # Emit a generation + nested tool spans for each assistant message. The
+        # shared helper also nests any Agent/Task subagent's internal steps under
+        # its tool span (via subagent_index).
+        _emit_assistant_steps(
+            langfuse,
+            assistant_msgs=turn.assistant_msgs,
+            tool_results_by_id=turn.tool_results_by_id,
+            injected_by_tool_id=turn.injected_by_tool_id,
+            parent_otel_span=parent_otel_span,
+            start_ts=user_ts,
+            first_user_text=user_text,
+            subagent_index=subagent_index,
+            depth=0,
+        )
 
-        for idx, am in enumerate(turn.assistant_msgs):
-            am_ts = parse_ts(am)
-            am_text_raw = extract_text(get_content(am))
-            am_text, am_text_meta = truncate_text(am_text_raw)
-            model = get_model(am)
-            tool_uses = iter_tool_uses(get_content(am))
-
-            # Build generation input: user message for first generation, otherwise tool results from
-            # the prior batch (best partial reconstruction of the prompt context).
-            if idx == 0:
-                gen_input: Any = {"role": "user", "content": user_text}
-            elif prev_tool_results:
-                gen_input = {"role": "tool", "tool_results": prev_tool_results}
-            else:
-                gen_input = None
-
-            # Build generation output: include both the text response and any tool calls the LLM
-            # decided to make. Most assistant messages in tool-using turns are tool-call-only, so
-            # without tool_calls in the output, the observation looks empty.
-            gen_tool_calls = []
-            for tu in tool_uses:
-                tu_input = tu.get("input")
-                if isinstance(tu_input, str):
-                    tu_input_serialized, _ = truncate_text(tu_input)
-                else:
-                    tu_input_serialized = tu_input
-                gen_tool_calls.append({
-                    "id": tu.get("id"),
-                    "name": tu.get("name"),
-                    "input": tu_input_serialized,
-                })
-
-            gen_output: Dict[str, Any] = {"role": "assistant"}
-            if am_text:
-                gen_output["content"] = am_text
-            if gen_tool_calls:
-                gen_output["tool_calls"] = gen_tool_calls
-
-            gen_kwargs: Dict[str, Any] = dict(
-                model=model,
-                input=gen_input,
-                output=gen_output,
-                metadata={
-                    "assistant_index": idx,
-                    "assistant_text": am_text_meta,
-                    "tool_count": len(tool_uses),
-                },
-            )
-            usage_details = get_usage(am)
-            if usage_details is not None:
-                gen_kwargs["usage_details"] = usage_details
-
-            gen_span = _start_backdated(
-                langfuse,
-                name=f"Claude Generation {idx + 1}",
-                as_type="generation",
-                start_time=prev_ts or am_ts,
-                parent_otel_span=parent_otel_span,
-                **gen_kwargs,
-            )
-
-            # Tool observations: nested under this generation. Each starts when the assistant
-            # emitted the tool_use (am_ts) and ends when its tool_result row arrived.
-            batch_result_ts: List[datetime] = []
-            batch_tool_results: List[Dict[str, Any]] = []
-            for tu in tool_uses:
-                tid = str(tu.get("id") or "")
-                tname = tu.get("name") or "unknown"
-                tinput_raw = tu.get("input") if isinstance(tu.get("input"), (dict, list, str, int, float, bool)) else {}
-                if isinstance(tinput_raw, str):
-                    tinput, tinput_meta = truncate_text(tinput_raw)
-                else:
-                    tinput, tinput_meta = tinput_raw, None
-
-                tr_entry = turn.tool_results_by_id.get(tid) if tid else None
-                if tr_entry:
-                    out_raw = tr_entry.get("content")
-                    out_str = out_raw if isinstance(out_raw, str) else json.dumps(out_raw, ensure_ascii=False)
-                    out_trunc, out_meta = truncate_text(out_str)
-                    tr_ts = parse_ts(tr_entry.get("timestamp"))
-                else:
-                    out_trunc, out_meta, tr_ts = None, None, None
-                if tr_ts is not None:
-                    batch_result_ts.append(tr_ts)
-
-                # Skill invocations inject their instructions as a separate transcript
-                # row; optionally surface them on the tool span they belong to.
-                tool_output: Any = out_trunc
-                if CAPTURE_SKILL_CONTENT:
-                    injected = turn.injected_by_tool_id.get(tid) if tid else None
-                    if injected:
-                        injected_trunc, _ = truncate_text(injected)
-                        tool_output = {"result": out_trunc, "injected_instructions": injected_trunc}
-
-                tool_span = _start_backdated(
-                    langfuse,
-                    name=f"Tool: {tname}",
-                    as_type="tool",
-                    start_time=am_ts,
-                    parent_otel_span=gen_span._otel_span,
-                    input=tinput,
-                    metadata={
-                        "tool_name": tname,
-                        "tool_id": tid,
-                        "input_meta": tinput_meta,
-                        "output_meta": out_meta,
-                    },
-                )
-                tool_span.update(output=tool_output)
-                tool_span.end(end_time=_to_ns(tr_ts or am_ts))
-
-                batch_tool_results.append({
-                    "tool_use_id": tid,
-                    "tool_name": tname,
-                    "output": out_trunc,
-                })
-
-            # End the generation AFTER its tools so the timeline cleanly contains them.
-            # If there were tool calls, gen ends with the last result; otherwise at am_ts.
-            gen_end_ts = max(batch_result_ts) if batch_result_ts else am_ts
-            gen_span.end(end_time=_to_ns(gen_end_ts or am_ts or prev_ts))
-
-            # Carry this batch's results into the next generation's input.
-            prev_tool_results = batch_tool_results
-
-            # Advance prev_ts: next generation can only start after this batch's tool results returned.
-            if batch_result_ts:
-                prev_ts = max(batch_result_ts)
-            elif am_ts is not None:
-                prev_ts = am_ts
-
-        trace_span.update(output={"role": "assistant", "content": final_assistant_text})
+        trace_span.update(output=[{"role": "assistant", "content": final_assistant_text}])
         trace_span.end(end_time=_to_ns(turn_end_ts or last_assistant_ts or user_ts))
 
 # ----------------- Main -----------------
@@ -793,16 +1033,30 @@ def main() -> int:
             ss = load_session_state(state, key)
 
             msgs, ss = read_new_jsonl(transcript_path, ss)
-            if not msgs:
-                write_session_state(state, key, ss)
-                save_state(state)
-                return 0
 
-            turns = build_turns(msgs)
+            # SessionEnd flushes the still-open turn; Stop holds it back so its
+            # continuation (Stop can fire many times within one turn — blocking
+            # hooks, background-agent notifications) is not dropped.
+            is_session_end = str(
+                payload.get("hook_event_name") or payload.get("hookEventName") or ""
+            ).lower() == "sessionend"
+
+            # Re-attach the carried-over open turn to the newly read rows, then
+            # split off the turns that are now closed (safe to emit) from the one
+            # still open (held back / persisted unless SessionEnd).
+            combined = (ss.pending or []) + msgs
+            closed_rows, open_rows = split_closed_open(combined, flush_all=is_session_end)
+            ss.pending = open_rows
+
+            turns = build_turns(closed_rows) if closed_rows else []
             if not turns:
                 write_session_state(state, key, ss)
                 save_state(state)
                 return 0
+
+            # Discover subagent transcripts once per firing so emit can nest each
+            # Agent/Task's internal steps under its tool span.
+            subagent_index = discover_subagents(transcript_path, session_id)
 
             # emit turns
             emitted = 0
@@ -810,7 +1064,8 @@ def main() -> int:
                 emitted += 1
                 turn_num = ss.turn_count + emitted
                 try:
-                    emit_turn(langfuse, session_id, turn_num, t, transcript_path, user_id=user_id)
+                    emit_turn(langfuse, session_id, turn_num, t, transcript_path,
+                              user_id=user_id, subagent_index=subagent_index)
                 except Exception as e:
                     # Log at INFO so SDK incompatibilities (and other emit failures)
                     # are visible without needing CC_LANGFUSE_DEBUG=true.
