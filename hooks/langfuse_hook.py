@@ -253,7 +253,7 @@ def is_tool_result(row: Dict[str, Any]) -> bool:
         return any(isinstance(x, dict) and x.get("type") == "tool_result" for x in content)
     return False
 
-def iter_tool_results(content: Any) -> List[Dict[str, Any]]:
+def get_tool_result_blocks(content: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if isinstance(content, list):
         for x in content:
@@ -505,7 +505,7 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
         # tool_result rows show up as role=user with content blocks of type tool_result
         if is_tool_result(msg):
             row_ts = msg.get("timestamp")
-            for tr in iter_tool_results(get_content_from_row(msg)):
+            for tr in get_tool_result_blocks(get_content_from_row(msg)):
                 tid = tr.get("tool_use_id")
                 if tid:
                     tool_results_by_id[str(tid)] = {"content": tr.get("content"), "timestamp": row_ts}
