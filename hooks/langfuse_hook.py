@@ -261,7 +261,7 @@ def get_tool_result_blocks(content: Any) -> List[Dict[str, Any]]:
                 out.append(x)
     return out
 
-def iter_tool_uses(content: Any) -> List[Dict[str, Any]]:
+def get_tool_use_blocks(content: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if isinstance(content, list):
         for x in content:
@@ -591,7 +591,7 @@ def collect_skill_tags(turn: Turn) -> List[str]:
     """Return 'skill:<name>' tags for every Skill tool invocation in the turn."""
     names: List[str] = []
     for am in turn.assistant_msgs:
-        for tu in iter_tool_uses(get_content_from_row(am)):
+        for tu in get_tool_use_blocks(get_content_from_row(am)):
             if tu.get("name") != "Skill":
                 continue
             tu_input = tu.get("input")
@@ -683,7 +683,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
             am_text_raw = extract_text(get_content_from_row(am))
             am_text, am_text_meta = truncate_text(am_text_raw)
             model = get_model(am)
-            tool_uses = iter_tool_uses(get_content_from_row(am))
+            tool_uses = get_tool_use_blocks(get_content_from_row(am))
 
             # Build generation input: user message for first generation, otherwise tool results from
             # the prior batch (best partial reconstruction of the prompt context).
