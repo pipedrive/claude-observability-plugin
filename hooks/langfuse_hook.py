@@ -454,7 +454,7 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
     - tool results dedupe by tool_use_id (latest wins)
     """
     turns: List[Turn] = []
-    current_user: Optional[Dict[str, Any]] = None
+    current_turn_user_row: Optional[Dict[str, Any]] = None
 
     # assistant messages for current turn:
     assistant_message_ids: List[str] = []             # message ids in order of first appearance (or synthetic)
@@ -464,23 +464,23 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
     injected_by_tool_id: Dict[str, str] = {}    # tool_use_id -> injected text (skill instructions)
 
     def flush_turn():
-        nonlocal current_user, assistant_message_ids, assistant_rows_by_message_id, tool_results_by_id, injected_by_tool_id, turns
-        if current_user is None:
+        nonlocal current_turn_user_row, assistant_message_ids, assistant_rows_by_message_id, tool_results_by_id, injected_by_tool_id, turns
+        if current_turn_user_row is None:
             return
         if not assistant_rows_by_message_id:
             return
         # Rebuild one assistant message per message.id, in the order the ids
         # first appeared. assistant_rows_by_message_id[message_id] holds all raw rows that shared that
         # id; merge_assistant_rows concatenates their content blocks into one.
-        assistants: List[Dict[str, Any]] = []
+        merged_assistant_rows: List[Dict[str, Any]] = []
         for message_id in assistant_message_ids:
             rows_for_id = assistant_rows_by_message_id.get(message_id)
             if not rows_for_id:
                 continue
-            assistants.append(merge_assistant_rows(rows_for_id))
+            merged_assistant_rows.append(merge_assistant_rows(rows_for_id))
         turns.append(Turn(
-            user_msg=current_user,
-            assistant_msgs=assistants,
+            user_msg=current_turn_user_row,
+            assistant_msgs=merged_assistant_rows,
             tool_results_by_id=dict(tool_results_by_id),
             injected_by_tool_id=dict(injected_by_tool_id),
         ))
@@ -516,7 +516,7 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             flush_turn()
 
             # start a new turn
-            current_user = row
+            current_turn_user_row = row
             assistant_message_ids = []
             assistant_rows_by_message_id = {}
             tool_results_by_id = {}
@@ -524,7 +524,7 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             continue
 
         if role == "assistant":
-            if current_user is None:
+            if current_turn_user_row is None:
                 # ignore assistant rows until we see a user message
                 continue
 
