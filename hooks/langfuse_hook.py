@@ -194,7 +194,7 @@ def read_hook_payload() -> Dict[str, Any]:
         debug(f"read_hook_payload exception: {e!r}")
         return {}
 
-def extract_session_and_transcript(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[Path]]:
+def extract_session_id_and_transcript_path(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[Path]]:
     """
     Tries a few plausible field names; exact keys can vary across hook types/versions.
     Prefer structured values from stdin over heuristics.
@@ -205,15 +205,15 @@ def extract_session_and_transcript(payload: Dict[str, Any]) -> Tuple[Optional[st
         or payload.get("session", {}).get("id")
     )
 
-    transcript = (
+    transcript_path_raw = (
         payload.get("transcriptPath")
         or payload.get("transcript_path")
         or payload.get("transcript", {}).get("path")
     )
 
-    if transcript:
+    if transcript_path_raw:
         try:
-            transcript_path = Path(transcript).expanduser().resolve()
+            transcript_path = Path(transcript_path_raw).expanduser().resolve()
         except Exception:
             transcript_path = None
     else:
@@ -222,35 +222,38 @@ def extract_session_and_transcript(payload: Dict[str, Any]) -> Tuple[Optional[st
     return session_id, transcript_path
 
 # ----------------- Transcript parsing helpers -----------------
-def get_content(msg: Dict[str, Any]) -> Any:
-    if not isinstance(msg, dict):
+def get_content_from_row(row: Dict[str, Any]) -> Any:
+    if not isinstance(row, dict):
         return None
-    if "message" in msg and isinstance(msg.get("message"), dict):
-        return msg["message"].get("content")
-    return msg.get("content")
+    message = row.get("message")
+    if isinstance(message, dict):
+        return message.get("content")
+    return row.get("content")
 
-def get_role(msg: Dict[str, Any]) -> Optional[str]:
-    # Claude Code transcript lines commonly have type=user/assistant OR message.role
-    t = msg.get("type")
-    if t in ("user", "assistant"):
-        return t
-    m = msg.get("message")
-    if isinstance(m, dict):
-        r = m.get("role")
-        if r in ("user", "assistant"):
-            return r
+def get_user_or_assistant_role_from_row(row: Dict[str, Any]) -> Optional[str]:
+    # Claude Code transcript row format is internal. Prefer top-level row.type
+    # when it marks a chat row, then fall back to nested message.role.
+    row_type = row.get("type")
+    if row_type in ("user", "assistant"):
+        return row_type
+
+    message = row.get("message")
+    if isinstance(message, dict):
+        role = message.get("role")
+        if role in ("user", "assistant"):
+            return role
     return None
 
-def is_tool_result(msg: Dict[str, Any]) -> bool:
-    role = get_role(msg)
+def is_tool_result(row: Dict[str, Any]) -> bool:
+    role = get_user_or_assistant_role_from_row(row)
     if role != "user":
         return False
-    content = get_content(msg)
+    content = get_content_from_row(row)
     if isinstance(content, list):
         return any(isinstance(x, dict) and x.get("type") == "tool_result" for x in content)
     return False
 
-def iter_tool_results(content: Any) -> List[Dict[str, Any]]:
+def get_tool_result_blocks(content: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if isinstance(content, list):
         for x in content:
@@ -258,7 +261,7 @@ def iter_tool_results(content: Any) -> List[Dict[str, Any]]:
                 out.append(x)
     return out
 
-def iter_tool_uses(content: Any) -> List[Dict[str, Any]]:
+def get_tool_use_blocks(content: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if isinstance(content, list):
         for x in content:
@@ -294,9 +297,9 @@ def get_model(msg: Dict[str, Any]) -> str:
         return m.get("model") or "claude"
     return "claude"
 
-def get_usage(msg: Dict[str, Any]) -> Optional[Dict[str, int]]:
+def get_usage_details_from_row(row: Dict[str, Any]) -> Optional[Dict[str, int]]:
     """Extract Anthropic token usage from an assistant message, if present."""
-    m = msg.get("message")
+    m = row.get("message")
     if not isinstance(m, dict):
         return None
     u = m.get("usage")
@@ -322,7 +325,7 @@ def get_message_id(msg: Dict[str, Any]) -> Optional[str]:
             return mid
     return None
 
-def parse_ts(value: Any) -> Optional[datetime]:
+def parse_timestamp(value: Any) -> Optional[datetime]:
     """Parse a Claude Code jsonl row timestamp (ISO 8601 with trailing Z)."""
     if isinstance(value, dict):
         value = value.get("timestamp")
@@ -336,9 +339,9 @@ def parse_ts(value: Any) -> Optional[datetime]:
 # ----------------- Incremental reader -----------------
 @dataclass
 class SessionState:
-    offset: int = 0
-    buffer: str = ""
-    turn_count: int = 0
+    offset: int = 0       # Last byte read from the transcript file.
+    buffer: str = ""      # Partial JSONL line kept between hook runs.
+    turn_count: int = 0   # Turns already emitted for this session.
 
 def load_session_state(global_state: Dict[str, Any], key: str) -> SessionState:
     s = global_state.get(key, {})
@@ -451,58 +454,58 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
     - tool results dedupe by tool_use_id (latest wins)
     """
     turns: List[Turn] = []
-    current_user: Optional[Dict[str, Any]] = None
+    current_turn_user_row: Optional[Dict[str, Any]] = None
 
     # assistant messages for current turn:
-    assistant_order: List[str] = []             # message ids in order of first appearance (or synthetic)
-    assistant_rows: Dict[str, List[Dict[str, Any]]] = {}  # id -> all rows (merged at flush)
+    assistant_message_ids: List[str] = []             # message ids in order of first appearance (or synthetic)
+    assistant_rows_by_message_id: Dict[str, List[Dict[str, Any]]] = {}  # id -> all rows (merged at flush)
 
     tool_results_by_id: Dict[str, Any] = {}     # tool_use_id -> content
     injected_by_tool_id: Dict[str, str] = {}    # tool_use_id -> injected text (skill instructions)
 
     def flush_turn():
-        nonlocal current_user, assistant_order, assistant_rows, tool_results_by_id, injected_by_tool_id, turns
-        if current_user is None:
+        nonlocal current_turn_user_row, assistant_message_ids, assistant_rows_by_message_id, tool_results_by_id, injected_by_tool_id, turns
+        if current_turn_user_row is None:
             return
-        if not assistant_rows:
+        if not assistant_rows_by_message_id:
             return
         # Rebuild one assistant message per message.id, in the order the ids
-        # first appeared. assistant_rows[mid] holds all raw rows that shared that
+        # first appeared. assistant_rows_by_message_id[message_id] holds all raw rows that shared that
         # id; merge_assistant_rows concatenates their content blocks into one.
-        assistants: List[Dict[str, Any]] = []
-        for mid in assistant_order:
-            rows_for_id = assistant_rows.get(mid)
+        merged_assistant_rows: List[Dict[str, Any]] = []
+        for message_id in assistant_message_ids:
+            rows_for_id = assistant_rows_by_message_id.get(message_id)
             if not rows_for_id:
                 continue
-            assistants.append(merge_assistant_rows(rows_for_id))
+            merged_assistant_rows.append(merge_assistant_rows(rows_for_id))
         turns.append(Turn(
-            user_msg=current_user,
-            assistant_msgs=assistants,
+            user_msg=current_turn_user_row,
+            assistant_msgs=merged_assistant_rows,
             tool_results_by_id=dict(tool_results_by_id),
             injected_by_tool_id=dict(injected_by_tool_id),
         ))
 
-    for msg in messages:
+    for row in messages:
         # Injected user rows (slash-command expansions, caveats, skill instructions)
         # carry isMeta=true. They are not real prompts — treating them as turn starts
         # creates phantom turns and prematurely flushes the real one.
-        if msg.get("isMeta"):
+        if row.get("isMeta"):
             # Skill invocations link their injected instructions to the originating
             # tool_use via sourceToolUseID; keep the text so emit can optionally
             # attach it to that tool span.
-            src = msg.get("sourceToolUseID")
+            src = row.get("sourceToolUseID")
             if src:
-                txt = extract_text(get_content(msg))
+                txt = extract_text(get_content_from_row(row))
                 if txt:
                     injected_by_tool_id[str(src)] = txt
             continue
 
-        role = get_role(msg)
+        role = get_user_or_assistant_role_from_row(row)
 
         # tool_result rows show up as role=user with content blocks of type tool_result
-        if is_tool_result(msg):
-            row_ts = msg.get("timestamp")
-            for tr in iter_tool_results(get_content(msg)):
+        if is_tool_result(row):
+            row_ts = row.get("timestamp")
+            for tr in get_tool_result_blocks(get_content_from_row(row)):
                 tid = tr.get("tool_use_id")
                 if tid:
                     tool_results_by_id[str(tid)] = {"content": tr.get("content"), "timestamp": row_ts}
@@ -513,23 +516,23 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             flush_turn()
 
             # start a new turn
-            current_user = msg
-            assistant_order = []
-            assistant_rows = {}
+            current_turn_user_row = row
+            assistant_message_ids = []
+            assistant_rows_by_message_id = {}
             tool_results_by_id = {}
             injected_by_tool_id = {}
             continue
 
         if role == "assistant":
-            if current_user is None:
+            if current_turn_user_row is None:
                 # ignore assistant rows until we see a user message
                 continue
 
-            mid = get_message_id(msg) or f"noid:{len(assistant_order)}"
-            if mid not in assistant_rows:
-                assistant_order.append(mid)
-                assistant_rows[mid] = []
-            assistant_rows[mid].append(msg)
+            message_id = get_message_id(row) or f"noid:{len(assistant_message_ids)}"
+            if message_id not in assistant_rows_by_message_id:
+                assistant_message_ids.append(message_id)
+                assistant_rows_by_message_id[message_id] = []
+            assistant_rows_by_message_id[message_id].append(row)
             continue
 
         # ignore unknown rows
@@ -588,7 +591,7 @@ def collect_skill_tags(turn: Turn) -> List[str]:
     """Return 'skill:<name>' tags for every Skill tool invocation in the turn."""
     names: List[str] = []
     for am in turn.assistant_msgs:
-        for tu in iter_tool_uses(get_content(am)):
+        for tu in get_tool_use_blocks(get_content_from_row(am)):
             if tu.get("name") != "Skill":
                 continue
             tu_input = tu.get("input")
@@ -615,18 +618,18 @@ def trace_display_name(session_id: str, turn_num: int) -> str:
 
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path,
               user_id: Optional[str] = None) -> None:
-    user_text_raw = extract_text(get_content(turn.user_msg))
+    user_text_raw = extract_text(get_content_from_row(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
 
     last_assistant = turn.assistant_msgs[-1]
-    final_assistant_text, _ = truncate_text(extract_text(get_content(last_assistant)))
+    final_assistant_text, _ = truncate_text(extract_text(get_content_from_row(last_assistant)))
 
-    user_ts = parse_ts(turn.user_msg)
-    last_assistant_ts = parse_ts(last_assistant)
+    user_ts = parse_timestamp(turn.user_msg)
+    last_assistant_ts = parse_timestamp(last_assistant)
     # Pick a turn end_time: latest among final assistant message or any tool result
     candidate_end_ts = [t for t in [last_assistant_ts] if t is not None]
     for tr in turn.tool_results_by_id.values():
-        t = parse_ts(tr)
+        t = parse_timestamp(tr)
         if t is not None:
             candidate_end_ts.append(t)
     turn_end_ts = max(candidate_end_ts) if candidate_end_ts else None
@@ -676,11 +679,11 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
         prev_tool_results: List[Dict[str, Any]] = []  # populated after each batch, surfaced as next gen's input
 
         for idx, am in enumerate(turn.assistant_msgs):
-            am_ts = parse_ts(am)
-            am_text_raw = extract_text(get_content(am))
+            am_ts = parse_timestamp(am)
+            am_text_raw = extract_text(get_content_from_row(am))
             am_text, am_text_meta = truncate_text(am_text_raw)
             model = get_model(am)
-            tool_uses = iter_tool_uses(get_content(am))
+            tool_uses = get_tool_use_blocks(get_content_from_row(am))
 
             # Build generation input: user message for first generation, otherwise tool results from
             # the prior batch (best partial reconstruction of the prompt context).
@@ -723,7 +726,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
                     "tool_count": len(tool_uses),
                 },
             )
-            usage_details = get_usage(am)
+            usage_details = get_usage_details_from_row(am)
             if usage_details is not None:
                 gen_kwargs["usage_details"] = usage_details
 
@@ -754,7 +757,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
                     out_raw = tr_entry.get("content")
                     out_str = out_raw if isinstance(out_raw, str) else json.dumps(out_raw, ensure_ascii=False)
                     out_trunc, out_meta = truncate_text(out_str)
-                    tr_ts = parse_ts(tr_entry.get("timestamp"))
+                    tr_ts = parse_timestamp(tr_entry.get("timestamp"))
                 else:
                     out_trunc, out_meta, tr_ts = None, None, None
                 if tr_ts is not None:
@@ -823,7 +826,7 @@ def main() -> int:
         return 0
 
     payload = read_hook_payload()
-    session_id, transcript_path = extract_session_and_transcript(payload)
+    session_id, transcript_path = extract_session_id_and_transcript_path(payload)
 
     if not session_id or not transcript_path:
         # No structured payload; fail open (do not guess)
