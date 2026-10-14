@@ -41,6 +41,9 @@ SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
+OPERATOR_SESSION_ID_VAR = "CC_LANGFUSE_SESSION_ID"
+OPERATOR_METADATA_VAR = "CC_LANGFUSE_TRACE_METADATA"
+OPERATOR_TRACE_NAME_VAR = "CC_LANGFUSE_TRACE_NAME"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
@@ -48,6 +51,10 @@ except ValueError:
 
 MAX_OPERATOR_TAGS = 20
 MAX_OPERATOR_TAG_CHARS = 200
+MAX_OPERATOR_METADATA_KEYS = 20
+# The SDK drops longer propagated values with a warning on its own logger;
+# checking here keeps the reason in the hook log.
+MAX_PROPAGATED_VALUE_CHARS = 200
 
 # Bound for unresolved task notifications kept in the state file between runs.
 MAX_PENDING_TASK_NOTIFICATIONS = 50
@@ -99,6 +106,71 @@ def parse_operator_tags(raw: str) -> Tuple[List[str], str]:
     return tags, warning
 
 OPERATOR_TAGS, _OPERATOR_TAGS_WARNING = parse_operator_tags(_opt(OPERATOR_TAGS_VAR))
+
+def parse_operator_string(var_name: str, raw: str) -> Tuple[str, str]:
+    """Parse a caller-supplied trace attribute that holds one string.
+
+    Returns the value and a warning. A value the SDK would reject is ignored
+    whole, so the hook's own default applies instead of a truncated value.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return "", ""
+    if not value.isascii():
+        return "", f"{var_name}: ignored, not US-ASCII"
+    if len(value) > MAX_PROPAGATED_VALUE_CHARS:
+        return "", f"{var_name}: ignored, over {MAX_PROPAGATED_VALUE_CHARS} characters"
+    return value, ""
+
+def parse_operator_metadata(raw: str) -> Tuple[Dict[str, str], str]:
+    """Parse caller metadata from a JSON object of scalar values.
+
+    Propagated metadata only carries strings, so values are converted to
+    their JSON text (true, 42). Null and blank values are skipped. Bad input
+    yields no metadata and a warning, never an exception.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {}, ""
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}, f"{OPERATOR_METADATA_VAR}: ignored, not valid JSON"
+    if not isinstance(parsed, dict):
+        return {}, f"{OPERATOR_METADATA_VAR}: ignored, JSON is not an object"
+
+    notes: List[str] = []
+    metadata: Dict[str, str] = {}
+    for key, value in parsed.items():
+        if not key.strip() or not key.isascii():
+            notes.append("blank or non-ASCII keys")
+            continue
+        if value is None:
+            continue
+        if not isinstance(value, (str, int, float, bool)):
+            notes.append("non-scalar values")
+            continue
+        text = value.strip() if isinstance(value, str) else json.dumps(value)
+        if not text:
+            continue
+        if len(text) > MAX_PROPAGATED_VALUE_CHARS:
+            notes.append(f"values over {MAX_PROPAGATED_VALUE_CHARS} characters")
+            continue
+        metadata[key] = text
+
+    if len(metadata) > MAX_OPERATOR_METADATA_KEYS:
+        notes.append(f"everything past the first {MAX_OPERATOR_METADATA_KEYS} keys")
+        metadata = dict(list(metadata.items())[:MAX_OPERATOR_METADATA_KEYS])
+    warning = f"{OPERATOR_METADATA_VAR}: dropped {', '.join(dict.fromkeys(notes))}" if notes else ""
+    return metadata, warning
+
+OPERATOR_SESSION_ID, _OPERATOR_SESSION_ID_WARNING = parse_operator_string(
+    OPERATOR_SESSION_ID_VAR, _opt(OPERATOR_SESSION_ID_VAR)
+)
+OPERATOR_METADATA, _OPERATOR_METADATA_WARNING = parse_operator_metadata(_opt(OPERATOR_METADATA_VAR))
+OPERATOR_TRACE_NAME, _OPERATOR_TRACE_NAME_WARNING = parse_operator_string(
+    OPERATOR_TRACE_NAME_VAR, _opt(OPERATOR_TRACE_NAME_VAR)
+)
 
 
 # ----------------- Paths -----------------
@@ -3217,16 +3289,21 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         completed_only=not close,
     )
     if parent_context is None:
+        # The caller's session only regroups traces in Langfuse: the Claude
+        # session id still keys hook state, seeds trace ids and stays in the
+        # root's metadata.
         attribute_propagation = propagate_attributes(
-            session_id=session_id,
+            session_id=OPERATOR_SESSION_ID or session_id,
             user_id=user_id,
-            trace_name=TRACE_NAME,
+            trace_name=OPERATOR_TRACE_NAME or TRACE_NAME,
             tags=get_trace_tags(turn, subagent_transcripts_by_tool_use_id),
+            metadata=OPERATOR_METADATA or None,
         )
     else:
-        # Attached mode: trace name, session, user and tags are trace-level
-        # fields owned by the launching application's trace — propagating
-        # them would overwrite the application's own values server-side.
+        # Attached mode: trace name, session, user, tags and metadata are
+        # trace-level fields owned by the launching application's trace —
+        # propagating them would overwrite the application's own values
+        # server-side.
         attribute_propagation = contextlib.nullcontext()
     with attribute_propagation:
         trace_span = None
@@ -3520,6 +3597,12 @@ def main() -> int:
         info(_STATE_DIR_WARNING)
     if _OPERATOR_TAGS_WARNING:
         info(_OPERATOR_TAGS_WARNING)
+    if _OPERATOR_SESSION_ID_WARNING:
+        info(_OPERATOR_SESSION_ID_WARNING)
+    if _OPERATOR_METADATA_WARNING:
+        info(_OPERATOR_METADATA_WARNING)
+    if _OPERATOR_TRACE_NAME_WARNING:
+        info(_OPERATOR_TRACE_NAME_WARNING)
 
     config = get_langfuse_config()
     if config is None:
